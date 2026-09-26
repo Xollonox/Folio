@@ -393,3 +393,12 @@ kbd {
   .tb-right .tb-btn[data-act='theme'] { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { .hb { animation: none; } }
+
+/* bending sheet */
+.sheet.bent { width: auto; transform-style: preserve-3d; }
+.strip { position: absolute; top: 0; transform-style: preserve-3d; }
+.strip .sf, .strip .sb { position: absolute; inset: 0; overflow: hidden; backface-visibility: hidden; -webkit-backface-visibility: hidden; }
+.strip .sb { transform: rotateY(180deg); }
+.strip .page { position: absolute; top: 0; border-radius: 0; cursor: default; }
+.strip .page.blank { background: #f6f1e6; }
+.strip .shade { position: absolute; inset: 0; opacity: 0; pointer-events: none; }

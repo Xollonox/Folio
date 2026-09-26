@@ -197,12 +197,12 @@ function pageSize() {
 function makePage(i, side) {
   const el = document.createElement('div');
   el.className = `page ${side}`;
-  if (i < 0 || i >= S.doc.count) { el.classList.add('blank'); return el; }
+  if (i < 0 || i >= S.doc.count) { el.classList.add('blank'); el._ready = Promise.resolve(); return el; }
   el.dataset.i = i;
   const inner = document.createElement('div');
   inner.className = 'page-content';
   el.appendChild(inner);
-  S.doc.render(inner, i, S.size.w).catch(console.error);
+  el._ready = S.doc.render(inner, i, S.size.w).catch(console.error);
   const shade = document.createElement('div');
   shade.className = 'gutter';
   el.appendChild(shade);
@@ -260,88 +260,133 @@ async function goTo(target) {
   save();
 }
 
-const FLIP_MS = 720;
-const EASE = 'cubic-bezier(.45,.05,.25,1)';
+const FLIP_MS = 780;
+const STRIPS = 14;
+const ease = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
 
-function buildSheet(frontI, backI, side) {
-  const sheet = document.createElement('div');
-  sheet.className = `sheet ${side}`;
-  const front = makePage(frontI, side === 'right' ? 'right' : 'left');
-  front.classList.add('face', 'front');
-  const back = makePage(backI, side === 'right' ? 'left' : 'right');
-  back.classList.add('face', 'back');
-  if (back.classList.contains('blank')) back.classList.add('reverse');
-  [front, back].forEach((f) => { const s = document.createElement('div'); s.className = 'lighting'; f.appendChild(s); });
-  sheet.append(front, back);
-  return sheet;
+// Copy a rendered page (DOM + canvas pixels) so it can be sliced into strips.
+function cloneContent(pageEl) {
+  const c = pageEl.cloneNode(true);
+  const src = pageEl.querySelectorAll('canvas');
+  c.querySelectorAll('canvas').forEach((cv, k) => { cv.getContext('2d').drawImage(src[k], 0, 0); });
+  c.style.left = '0';
+  return c;
 }
 
-function animateSheet(sheet, from, to, castEl) {
-  const mid = (from + to) / 2;
-  const lift = to < from ? -1 : 1;
-  const anim = sheet.animate([
-    { transform: `rotateY(${from}deg) translateZ(0.1px)` },
-    { transform: `rotateY(${mid}deg) translateZ(4px) rotateX(${lift * 1.2}deg)`, offset: 0.5 },
-    { transform: `rotateY(${to}deg) translateZ(0.1px)` },
-  ], { duration: FLIP_MS, easing: EASE, fill: 'forwards' });
-  const [lf, lb] = sheet.querySelectorAll('.lighting');
-  const dirSign = Math.sign(to - from);
-  // front darkens as it lifts away; back brightens as it lands
-  lf.animate([{ opacity: 0 }, { opacity: 0.55 }], { duration: FLIP_MS / 2, easing: 'ease-in', fill: 'forwards' });
-  lb.animate([{ opacity: 0.6 }, { opacity: 0.15, offset: 0.7 }, { opacity: 0 }], { duration: FLIP_MS, easing: 'ease-out', fill: 'forwards' });
-  sheet.style.setProperty('--dir', dirSign);
-  if (castEl) {
-    castEl.animate([{ opacity: 0 }, { opacity: 0.9, offset: 0.35 }, { opacity: 0 }], { duration: FLIP_MS, easing: 'ease-out', fill: 'forwards' });
+async function readyPage(i, side) {
+  const el = makePage(i, side);
+  await el._ready;
+  return el;
+}
+
+// A turning sheet built from nested hinged strips, so the paper bends while it
+// rotates instead of swinging like a rigid board. side: 'right' hinges on its
+// left edge (forward turn), 'left' hinges on its right edge (backward turn).
+function buildBentSheet(frontEl, backEl, side, x) {
+  const { w, h } = S.size;
+  const sw = w / STRIPS;
+  const sheet = document.createElement('div');
+  sheet.className = `sheet bent ${side}`;
+  sheet.style.left = x + 'px';
+  const strips = [];
+  let parent = sheet;
+  for (let i = 0; i < STRIPS; i++) {
+    const s = document.createElement('div');
+    s.className = 'strip';
+    s.style.cssText = `width:${sw + 0.6}px;height:${h}px;transform-origin:${side === 'right' ? 'left' : 'right'} center;` +
+      (i === 0 ? (side === 'right' ? 'left:0' : `left:${w - sw}px`) : `left:${side === 'right' ? sw : -sw}px`);
+    const f = document.createElement('div'); f.className = 'sf';
+    const b = document.createElement('div'); b.className = 'sb';
+    const fx = side === 'right' ? i * sw : w - (i + 1) * sw;
+    const bx = side === 'right' ? w - (i + 1) * sw : i * sw;
+    const fc = cloneContent(frontEl); fc.style.left = -fx + 'px';
+    const bc = cloneContent(backEl); bc.style.left = -bx + 'px';
+    f.appendChild(fc); b.appendChild(bc);
+    const fl = document.createElement('i'); fl.className = 'shade';
+    const bl = document.createElement('i'); bl.className = 'shade';
+    f.appendChild(fl); b.appendChild(bl);
+    s.append(f, b);
+    parent.appendChild(s);
+    strips.push({ s, fl, bl });
+    parent = s;
   }
-  return anim.finished;
+  return { sheet, strips };
+}
+
+function runBend({ strips }, from, to, cast, fade) {
+  const dir = Math.sign(to - from);
+  const maxCurl = 70; // total extra bend across the sheet at mid-turn
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    const frame = (now) => {
+      const p = Math.min(1, (now - t0) / FLIP_MS);
+      const e = ease(p);
+      const root = from + (to - from) * e;
+      const curl = Math.sin(Math.PI * e) * maxCurl * dir;
+      let abs = 0;
+      strips.forEach(({ s, fl, bl }, i) => {
+        // the free edge leads the turn; bend grows toward the edge
+        const a = i === 0 ? root : (curl / (STRIPS - 1)) * (0.4 + (1.2 * i) / STRIPS);
+        abs += a;
+        s.style.transform = `rotateY(${a}deg)`;
+        const facing = Math.cos((abs * Math.PI) / 180); // 1 flat, 0 edge-on
+        const light = S.effects ? (1 - Math.abs(facing)) * 0.5 : 0;
+        const gloss = S.effects ? Math.max(0, Math.sin((abs * Math.PI) / 90)) * 0.12 : 0;
+        fl.style.opacity = light; bl.style.opacity = light;
+        fl.style.background = `rgba(${gloss > 0.06 ? '255,250,240' : '30,18,4'},1)`;
+      });
+      if (cast) cast.style.opacity = Math.sin(Math.PI * e) * 0.95;
+      if (fade) fade(p);
+      if (p < 1) requestAnimationFrame(frame); else resolve();
+    };
+    requestAnimationFrame(frame);
+  });
 }
 
 async function flipSpread(book, fromK, toK, dir) {
   const [cl, cr] = spreadPages(fromK);
   const [nl, nr] = spreadPages(toK);
-  const leftSlot = book.querySelector('.page.left');
-  const rightSlot = book.querySelector('.page.right');
+  const w = S.size.w;
   const cast = document.createElement('div');
   if (dir > 0) {
-    // underneath the turning sheet: next spread's right page
-    const under = makePage(nr, 'right'); under.classList.add('under');
-    book.replaceChild(under, rightSlot);
+    const [front, back, under] = await Promise.all([readyPage(cr, 'right'), readyPage(nl, 'left'), readyPage(nr, 'right')]);
+    under.classList.add('under');
+    book.replaceChild(under, book.querySelector('.page.right'));
     cast.className = 'cast right'; book.appendChild(cast);
-    const sheet = buildSheet(cr, nl, 'right');
-    book.appendChild(sheet);
+    const bent = buildBentSheet(front, back, 'right', w);
+    book.appendChild(bent.sheet);
     book.classList.toggle('closed-right', nr >= S.doc.count);
-    await animateSheet(sheet, 0, -180, cast);
+    await runBend(bent, 0, -180, cast);
   } else {
-    const under = makePage(nl, 'left'); under.classList.add('under');
-    book.replaceChild(under, leftSlot);
+    const [front, back, under] = await Promise.all([readyPage(cl, 'left'), readyPage(nr, 'right'), readyPage(nl, 'left')]);
+    under.classList.add('under');
+    book.replaceChild(under, book.querySelector('.page.left'));
     cast.className = 'cast left'; book.appendChild(cast);
-    const sheet = buildSheet(cl, nr, 'left');
-    book.appendChild(sheet);
+    const bent = buildBentSheet(front, back, 'left', 0);
+    book.appendChild(bent.sheet);
     book.classList.toggle('closed-left', nl < 0);
-    await animateSheet(sheet, 0, 180, cast);
+    await runBend(bent, 0, 180, cast);
   }
 }
 
 async function flipSingle(book, target, dir) {
-  const cur = book.querySelector('.page.solo');
   const cast = document.createElement('div');
   cast.className = 'cast solo';
+  const blank = makePage(-1, 'solo'); blank.classList.add('reverse');
   if (dir > 0) {
-    const under = makePage(target, 'solo'); under.classList.add('under');
-    book.replaceChild(under, cur);
+    const [front, under] = await Promise.all([readyPage(S.page, 'solo'), readyPage(target, 'solo')]);
+    under.classList.add('under');
+    book.replaceChild(under, book.querySelector('.page.solo'));
     book.appendChild(cast);
-    const sheet = buildSheet(S.page, -1, 'right');
-    sheet.classList.add('solo-sheet');
-    book.appendChild(sheet);
-    const fade = sheet.animate([{ opacity: 1 }, { opacity: 1, offset: 0.6 }, { opacity: 0 }], { duration: FLIP_MS, fill: 'forwards' });
-    await Promise.all([animateSheet(sheet, 0, -180, cast), fade.finished]);
+    const bent = buildBentSheet(front, blank, 'right', 0);
+    book.appendChild(bent.sheet);
+    await runBend(bent, 0, -180, cast, (p) => { bent.sheet.style.opacity = p < 0.6 ? 1 : 1 - (p - 0.6) / 0.4; });
   } else {
+    const front = await readyPage(target, 'solo');
     book.appendChild(cast);
-    const sheet = buildSheet(target, -1, 'right');
-    sheet.classList.add('solo-sheet');
-    book.appendChild(sheet);
-    sheet.animate([{ opacity: 0 }, { opacity: 1, offset: 0.4 }, { opacity: 1 }], { duration: FLIP_MS, fill: 'forwards' });
-    await animateSheet(sheet, -180, 0, cast);
+    const bent = buildBentSheet(front, blank, 'right', 0);
+    book.appendChild(bent.sheet);
+    await runBend(bent, -180, 0, cast, (p) => { bent.sheet.style.opacity = Math.min(1, p / 0.4); });
   }
 }
 
